@@ -30,9 +30,10 @@ export function attachCustomTranscriberWS(server) {
     console.log('🟢 WebSocket connection opened from Vapi');
     let dgLive = null;
     let rmsHistory = [];
-    // Latency tracking: stores timestamps for each audio chunk received
-    let audioTimestamps = [];
-    let utteranceLatencies = []; // Store all per-utterance latencies
+
+    // Simplified latency tracking
+    let lastAudioTimestamp = null;
+    let utteranceLatencies = [];
 
     function getMaxRMSInWindow() {
       const now = Date.now();
@@ -51,6 +52,7 @@ export function attachCustomTranscriberWS(server) {
           return;
         }
         console.log('📩 Received JSON message:', obj);
+
         if (obj.type === 'start') {
           console.log('🚀 Received "start" — initializing Deepgram live transcription');
           dgLive = deepgram.listen.live({
@@ -74,54 +76,46 @@ export function attachCustomTranscriberWS(server) {
           dgLive.on(LiveTranscriptionEvents.Close, (ev) =>
             console.log('🛑 Deepgram connection closed:', ev)
           );
+
           dgLive.on(LiveTranscriptionEvents.Transcript, (event) => {
-            console.log('🗒️ Transcript event received:', event);
             const transcript = event.channel?.alternatives?.[0]?.transcript || '';
             const confidence = event.channel?.alternatives?.[0]?.confidence || null;
             const isFinal = !!event.is_final;
             if (!transcript.trim()) return;
+
             const [channelIndex] = event.channel_index || [];
             if (channelIndex === undefined) return;
             const label = channelIndex === 0 ? 'CUSTOMER (CH-0)' : 'ASSISTANT (CH-1)';
+
             if (isFinal) {
-              // On final transcript, calculate latency if possible
-              console.log('✅ Processing final transcript event');
+              const now = Date.now();
+              const latencyMs = lastAudioTimestamp ? now - lastAudioTimestamp : null;
+              if (latencyMs !== null) utteranceLatencies.push(latencyMs);
+
               const maxRMS = getMaxRMSInWindow();
-              let latencyMs = null;
-              // Log the state of audioTimestamps for debugging
-              console.log(`[LATENCY_LOG] audioTimestamps before shift:`, audioTimestamps);
-              if (audioTimestamps.length > 0) {
-                const firstAudioTimestamp = audioTimestamps.shift();
-                latencyMs = Date.now() - firstAudioTimestamp;
-                utteranceLatencies.push(latencyMs); // Track for average
-                console.log(`[LATENCY_LOG] audioTimestamps after shift:`, audioTimestamps);
-              } else {
-                console.log(`[LATENCY_LOG] ⚠️ No audio timestamp found for latency calculation. This may indicate a mismatch between audio chunks and transcript events.`);
-              }
-              // Log all metrics together
               console.log(
-                `📤 FINAL transcript ${label}: "${transcript.trim()}" | 🎯 Confidence: ${confidence} | 🎙 Max RMS (last ${RMS_WINDOW_MS}ms): ${maxRMS.toFixed(4)} | ⏱️ Latency: ${latencyMs !== null ? latencyMs + ' ms' : 'N/A'}`
+                `📤 FINAL transcript ${label}: "${transcript.trim()}" | 🎯 Confidence: ${confidence} | 🎙 Max RMS: ${maxRMS.toFixed(4)} | ⏱️ Latency: ${latencyMs ? latencyMs + ' ms' : 'N/A'}`
               );
-            } else {
-              console.log(
-                `📝 Interim transcript ${label}: "${transcript.trim()}" | 🎯 Confidence: ${confidence}`
-              );
-            }
-            if (isFinal) {
+
               let responseText = transcript.trim();
               if (confidence !== null && confidence < 0.8) {
                 responseText = "rephrase i couldn't hear you clearly";
               }
-              const maxRMS = getMaxRMSInWindow();
               if (maxRMS < RMS_THRESHOLD) {
                 responseText = "rephrase please come closer or speak loudly your voice was not clear";
               }
+
               ws.send(
                 JSON.stringify({
                   type: 'transcriber-response',
                   transcription: responseText,
                   channel: channelIndex === 0 ? 'customer' : 'assistant',
+                  latencyMs: latencyMs || 'N/A', // optional latency info
                 })
+              );
+            } else {
+              console.log(
+                `📝 Interim transcript ${label}: "${transcript.trim()}" | 🎯 Confidence: ${confidence}`
               );
             }
           });
@@ -134,17 +128,15 @@ export function attachCustomTranscriberWS(server) {
           console.log('⚠️ Unknown message type:', obj.type);
         }
       } else {
-        // When a binary audio chunk is received, record the timestamp
+        // Binary audio chunk received
         if (dgLive?.send) {
           const now = Date.now();
-          console.log(`🔊 Audio chunk received (binary) at ${now}`);
-          console.log(`[LATENCY_LOG] audioTimestamps before push:`, audioTimestamps);
           dgLive.send(msg);
           const rms = calculateRMS(msg);
           rmsHistory.push({ rms, time: now });
-          // Push the current time to the array for latency tracking
-          audioTimestamps.push(now);
-          console.log(`[LATENCY_LOG] audioTimestamps after push:`, audioTimestamps);
+
+          // Store the most recent audio timestamp
+          lastAudioTimestamp = now;
         } else {
           console.warn('⚠ Audio chunk received before Deepgram stream ready — dropped');
         }
@@ -153,22 +145,16 @@ export function attachCustomTranscriberWS(server) {
 
     ws.on('close', () => {
       // On close, log average latency if any utterances were processed
-      let callSummary = {};
       if (utteranceLatencies.length > 0) {
         const sum = utteranceLatencies.reduce((a, b) => a + b, 0);
         const avg = sum / utteranceLatencies.length;
-        callSummary = {
-          averageLatencyMs: avg,
-          utteranceCount: utteranceLatencies.length,
-          utteranceLatencies: utteranceLatencies
-        };
-        console.log(`[LATENCY_LOG] 📊 Average latency for call: ${avg.toFixed(2)} ms over ${utteranceLatencies.length} utterances`);
-        console.log(`[LATENCY_LOG] Call summary:`, callSummary);
+        console.log(`[LATENCY_LOG] 📊 Average latency: ${avg.toFixed(2)} ms over ${utteranceLatencies.length} utterances`);
+        console.log(`[LATENCY_LOG] All latencies:`, utteranceLatencies);
+        console.log(`[ℹ️] Average latency ≈ typical speech→text delay the user experiences.`);
       } else {
-        callSummary = { averageLatencyMs: null, utteranceCount: 0, utteranceLatencies: [] };
         console.log('[LATENCY_LOG] No utterance latencies recorded for this call.');
-        console.log(`[LATENCY_LOG] Call summary:`, callSummary);
       }
+
       console.log('❌ WebSocket connection closed by client; closing Deepgram stream');
       if (dgLive?.close) {
         dgLive.close();
