@@ -28,6 +28,8 @@ export function attachCustomTranscriberWS(server) {
     console.log('🟢 WebSocket connection opened from Vapi');
     let dgLive = null;
     let rmsHistory = [];
+    let lastUserAudioTimestamp = null;
+    let pendingUserUtteranceTimestamp = null;
 
     function getMaxRMSInWindow() {
       const now = Date.now();
@@ -82,6 +84,16 @@ export function attachCustomTranscriberWS(server) {
               console.log(
                 `📤 FINAL transcript ${label}: "${transcript.trim()}" | 🎯 Confidence: ${confidence} | 🎙 Max RMS (last ${RMS_WINDOW_MS}ms): ${maxRMS.toFixed(4)}`
               );
+              // End-to-end latency logic
+              if (channelIndex === 0) {
+                pendingUserUtteranceTimestamp = lastUserAudioTimestamp;
+              }
+              if (channelIndex === 1 && pendingUserUtteranceTimestamp) {
+                const now = Date.now();
+                const endToEndLatency = now - pendingUserUtteranceTimestamp;
+                console.log(`[END_TO_END_LATENCY] User→Assistant: ${endToEndLatency} ms`);
+                pendingUserUtteranceTimestamp = null;
+              }
             } else {
               console.log(
                 `📝 Interim transcript ${label}: "${transcript.trim()}" | 🎯 Confidence: ${confidence}`
@@ -116,6 +128,8 @@ export function attachCustomTranscriberWS(server) {
           dgLive.send(msg);
           const rms = calculateRMS(msg);
           rmsHistory.push({ rms, time: Date.now() });
+          // Track last user audio timestamp for latency
+          lastUserAudioTimestamp = Date.now();
         } else {
           console.warn('⚠ Audio chunk received before Deepgram stream ready — dropped');
         }
