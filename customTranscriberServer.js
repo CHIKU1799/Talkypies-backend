@@ -35,6 +35,11 @@ export function attachCustomTranscriberWS(server) {
     let lastAudioTimestamp = null;
     let utteranceLatencies = [];
 
+    // --- Added variables for end-to-end latency ---
+    let lastUserAudioTimestamp = null; // When user last sent audio
+    let pendingUserUtteranceTimestamp = null; // For pairing with assistant reply
+    // --- End of added variables ---
+
     function getMaxRMSInWindow() {
       const now = Date.now();
       rmsHistory = rmsHistory.filter((entry) => now - entry.time <= RMS_WINDOW_MS);
@@ -93,6 +98,20 @@ export function attachCustomTranscriberWS(server) {
               if (latencyMs !== null) utteranceLatencies.push(latencyMs);
 
               const maxRMS = getMaxRMSInWindow();
+
+              // --- End-to-end latency logic ---
+              // If user final transcript, store the timestamp for next assistant reply
+              if (channelIndex === 0) {
+                pendingUserUtteranceTimestamp = lastUserAudioTimestamp;
+              }
+              // If assistant final transcript, calculate end-to-end latency
+              if (channelIndex === 1 && pendingUserUtteranceTimestamp) {
+                const endToEndLatency = now - pendingUserUtteranceTimestamp;
+                console.log(`[END_TO_END_LATENCY] User→Assistant: ${endToEndLatency} ms`);
+                pendingUserUtteranceTimestamp = null; // Reset for next exchange
+              }
+              // --- End end-to-end latency logic ---
+
               console.log(
                 `📤 FINAL transcript ${label}: "${transcript.trim()}" | 🎯 Confidence: ${confidence} | 🎙 Max RMS: ${maxRMS.toFixed(4)} | ⏱️ Latency: ${latencyMs ? latencyMs + ' ms' : 'N/A'}`
               );
@@ -137,6 +156,9 @@ export function attachCustomTranscriberWS(server) {
 
           // Store the most recent audio timestamp
           lastAudioTimestamp = now;
+
+          // For end-to-end latency: if this is user audio, update lastUserAudioTimestamp
+          lastUserAudioTimestamp = now;
         } else {
           console.warn('⚠ Audio chunk received before Deepgram stream ready — dropped');
         }
